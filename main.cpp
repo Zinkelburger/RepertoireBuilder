@@ -211,6 +211,7 @@ void traverseTree(chessNode* root, std::string pgn, std::ofstream& outputFile) {
     for(int i = 0; i < root->getNumChildren(); i++) {
         traverseTree(root->getChild(i), pgn, outputFile);
     }
+    delete root;
 }
 
 int main() {
