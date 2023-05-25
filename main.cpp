@@ -1,15 +1,20 @@
 // Copyright Andrew Bernal 2023
-#include <curl/curl.h>
+#include <pqxx/pqxx>
 #include <algorithm>
-#include <chrono>
 #include <iostream>
 #include <string>
-#include <thread>
+#include <sstream>
 #include <vector>
 #include <fstream>
-#include <nlohmann/json.hpp>
+#include "thc.h"
 
-using json = nlohmann::json;
+class chessNode;
+// builds the tree of chess nodes to put in the PGN file
+void buildTree(pqxx::work& txn, chessNode* node,
+const std::string& FEN, bool whiteToMove, int totalGamesFromStartingPosition);
+// returns the move with the highest win rate from the childrenMoves
+std::string getBestWhiteMove(pqxx::work& txn,
+const std::vector<std::string>& childrenMoves, const std::string& FEN);
 
 class chessNode {
  public:
@@ -31,6 +36,7 @@ class chessNode {
     int getNumChildren() {
         return children.size();
     }
+
  private:
     std::string UCImove;
     int whiteWin;
@@ -39,166 +45,197 @@ class chessNode {
     std::vector<chessNode*> children;
 };
 
-size_t writeFunction(void *ptr, size_t size, size_t nmemb, std::string* data) {
-    data->append((char*) ptr, size * nmemb);
-    return size * nmemb;
+std::string getBestWhiteMove(pqxx::work& txn, const std::vector<std::string>& childrenMoves,
+const std::string& FEN) {
+    // Select the highest win rate white move from the top 3 most played moves
+    std::vector<std::string> sortedMoves = childrenMoves;
+    std::sort(sortedMoves.begin(), sortedMoves.end(),
+    [&](const std::string& a, const std::string& b) {
+        // Initialize the chessboard with the given FEN
+        thc::ChessRules cr;
+        cr.Forsyth(FEN.c_str());
+
+        // Make move a on the chessboard
+        thc::Move mv;
+        mv.NaturalIn(&cr, a.c_str());
+        cr.PlayMove(mv);
+
+        // Generate the updated FEN for move a
+        std::string updatedFenA = cr.ForsythPublish();
+
+        // Query the database for data for move a
+        pqxx::result aResult = txn.exec_params(
+            "SELECT white_wins, black_wins, draws FROM lichess WHERE fen = $1",
+            updatedFenA);
+
+        // Reset the chessboard to the original FEN
+        cr.Forsyth(FEN.c_str());
+
+        // Make move b on the chessboard
+        mv.NaturalIn(&cr, b.c_str());
+        cr.PlayMove(mv);
+
+        // Generate the updated FEN for move b
+        std::string updatedFenB = cr.ForsythPublish();
+
+        // Query the database for data for move b
+        pqxx::result bResult = txn.exec_params(
+            "SELECT white_wins, black_wins, draws FROM lichess WHERE fen = $1",
+            updatedFenB);
+
+        int aTotal = aResult[0][0].as<int>() + aResult[0][1].as<int>() +
+                    aResult[0][2].as<int>();
+        int bTotal = bResult[0][0].as<int>() + bResult[0][1].as<int>() +
+                    bResult[0][2].as<int>();
+
+        return aTotal > bTotal;
+    });
+    sortedMoves.resize(std::min<size_t>(3, sortedMoves.size()));
+
+    auto it = std::max_element(sortedMoves.begin(), sortedMoves.end(),
+    [&](const std::string& a, const std::string& b) {
+        // Initialize the chessboard with the given FEN
+        thc::ChessRules cr;
+        cr.Forsyth(FEN.c_str());
+
+        // Make move a on the chessboard
+        thc::Move mv;
+        mv.NaturalIn(&cr, a.c_str());
+        cr.PlayMove(mv);
+
+        // Generate the updated FEN for move a
+        std::string updatedFenA = cr.ForsythPublish();
+
+        // Query the database for data for move a
+        pqxx::result aResult = txn.exec_params(
+            "SELECT white_wins, black_wins, draws FROM lichess WHERE fen = $1",
+            updatedFenA);
+
+        // Reset the chessboard to the original FEN
+        cr.Forsyth(FEN.c_str());
+
+        // Make move b on the chessboard
+        mv.NaturalIn(&cr, b.c_str());
+        cr.PlayMove(mv);
+
+        // Generate the updated FEN for move b
+        std::string updatedFenB = cr.ForsythPublish();
+
+        // Query the database for data for move b
+        pqxx::result bResult = txn.exec_params(
+            "SELECT white_wins, black_wins, draws FROM lichess WHERE fen = $1",
+            updatedFenB);
+
+        int aTotal = aResult[0][0].as<int>() + aResult[0][1].as<int>() +
+                    aResult[0][2].as<int>();
+        int bTotal = bResult[0][0].as<int>() + bResult[0][1].as<int>() +
+                    bResult[0][2].as<int>();
+
+        double aWinRate =
+            aTotal == 0 ? 0 : static_cast<double>(aResult[0][0].as<int>()) / aTotal;
+
+        double bWinRate =
+            bTotal == 0 ? 0 : static_cast<double>(bResult[0][0].as<int>()) / bTotal;
+
+        return aWinRate < bWinRate;
+    });
+    return *it;
 }
 
-void buildTree(chessNode* node, const std::string& FEN, const std::string& moves, bool whiteToMove, int totalGamesFromStartingPosition) {
-    CURL *curl = curl_easy_init();
-    if (!curl) { return; }
+void buildTree(pqxx::work& txn, chessNode* node, const std::string& FEN,
+bool whiteToMove, int totalGamesFromStartingPosition) {
+    // Query the database for data for the given FEN
+    pqxx::result result = txn.exec_params("SELECT white_wins, black_wins, draws, "
+    "children_moves FROM lichess WHERE fen = $1", FEN);
 
-    std::string url = "https://explorer.lichess.ovh/lichess?variant=standard&speeds=blitz,rapid,classical&ratings=2200,2500&fen=";
-    url += FEN;
-
-    if (!moves.empty()) {
-        url += "&play=";
-        url += moves;
+    // Check if a row was returned
+    if (result.size() == 0) {
+        // No data was found for the given FEN
+        return;
     }
 
-    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-
-    std::string response_string;
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writeFunction);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response_string);
-
-    json j;
-
-    bool shouldContinue = false;
-    do {
-        try {
-            // rate limiting to follow the lichess api's request
-            long response_code = 0;
-            do {
-                CURLcode res = curl_easy_perform(curl);
-                if (res != CURLE_OK) {
-                    std::cerr << "curl_easy_perform() failed: " << curl_easy_strerror(res) << std::endl;
-                    std::this_thread::sleep_for(std::chrono::seconds(15));
-                    return;
-                }
-
-                curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response_code);
-                if (response_code == 429) {
-                    std::cerr << "Rate limited. Waiting for 60 seconds before retrying..." << std::endl;
-                    std::this_thread::sleep_for(std::chrono::seconds(61));
-                }
-            } while (response_code == 429);
-
-            // print for debugging
-            // std::cout << response_string << "\n";
-
-            try {
-                j = json::parse(response_string);
-                shouldContinue = false;
-            } catch (const json::parse_error& e) {
-                shouldContinue = true;
-            }
-        } catch (...) {
-            std::cerr << "Something went wrong. Trying again in 15 seconds." << std::endl;
-            std::this_thread::sleep_for(std::chrono::seconds(15));
-        }
-    } while (shouldContinue);
-   
-
-    // int totalGames = j["white"].get<int>() + j["black"].get<int>() + j["draws"].get<int>();
+    // Get the data from the result
+    int whiteWins = result[0][0].as<int>();
+    int blackWins = result[0][1].as<int>();
+    int draws = result[0][2].as<int>();
+    // Manually parse the children_moves array
+    std::string childrenMovesStr = result[0][3].as<std::string>();
+    std::vector<std::string> childrenMoves;
+    std::stringstream ss(childrenMovesStr.substr(1, childrenMovesStr.size() - 2));
+    std::string tempMove;
+    while (std::getline(ss, tempMove, ',')) {
+        childrenMoves.push_back(tempMove);
+    }
 
     if (whiteToMove) {
-        // Select the highest win rate white move from the top 3 most played moves
-        std::vector<json> topMoves(j["moves"].begin(), j["moves"].end());
-        std::sort(topMoves.begin(), topMoves.end(), [](const json& a, const json& b) {
-            int aTotal = a["white"].get<int>() + a["black"].get<int>() + a["draws"].get<int>();
-            int bTotal = b["white"].get<int>() + b["black"].get<int>() + b["draws"].get<int>();
-            return aTotal > bTotal;
-        });
-        topMoves.resize(std::min<size_t>(3, topMoves.size()));
+        const std::string& move = getBestWhiteMove(txn, childrenMoves, FEN);
 
-        auto it = std::max_element(topMoves.begin(), topMoves.end(), [](const json& a, const json& b) {
-            int aTotal = a["white"].get<int>() + a["black"].get<int>() + a["draws"].get<int>();
-            int bTotal = b["white"].get<int>() + b["black"].get<int>() + b["draws"].get<int>();
-            double aWinRate = aTotal == 0 ? 0 : static_cast<double>(a["white"].get<int>()) / aTotal;
-            double bWinRate = bTotal == 0 ? 0 : static_cast<double>(b["white"].get<int>()) / bTotal;
-            return aWinRate < bWinRate;
-        });
-        const json& move = *it;
-
-        int whiteWins = move["white"];
-        int blackWins = move["black"];
-        int draws = move["draws"];
-
-        chessNode* child = new chessNode(whiteWins, blackWins, draws, move["uci"]);
+        chessNode* child = new chessNode(whiteWins, blackWins, draws, move);
         node->addChild(child);
 
-        std::string newMoves = moves;
-        if (!newMoves.empty()) { newMoves += ","; }
-        newMoves += move["uci"];
+        // Initialize the chessboard with the given FEN
+        thc::ChessRules cr;
+        cr.Forsyth(FEN.c_str());
 
-        buildTree(child, FEN, newMoves, !whiteToMove, totalGamesFromStartingPosition);
+        // Make the move on the chessboard
+        thc::Move mv;
+        mv.NaturalIn(&cr, move.c_str());
+        cr.PlayMove(mv);
+
+        // Generate the updated FEN
+        std::string updatedFen = cr.ForsythPublish();
+
+        buildTree(txn, child, updatedFen, !whiteToMove, totalGamesFromStartingPosition);
     } else {
-        // Select all of the black moves with 1/1000 frequency of being played in the starting position
-        for (const auto& move : j["moves"]) {
-            int whiteWins = move["white"];
-            int blackWins = move["black"];
-            int draws = move["draws"];
+        // all of the black moves with 1/1000 frequency of being played in the starting position
+        for (const auto& move : childrenMoves) {
+            // Generate the updated FEN
+            thc::ChessRules cr;
+            cr.Forsyth(FEN.c_str());
+            thc::Move mv;
+            mv.NaturalIn(&cr, move.c_str());
+            cr.PlayMove(mv);
+            std::string updatedFen = cr.ForsythPublish();
+
+            pqxx::result moveResult = txn.exec_params(
+                "SELECT white_wins, black_wins, draws FROM lichess WHERE fen = $1", updatedFen);
+
+            int whiteWins = moveResult[0][0].as<int>();
+            int blackWins = moveResult[0][1].as<int>();
+            int draws = moveResult[0][2].as<int>();
             int totalChildGames = whiteWins + blackWins + draws;
 
-            double probability = static_cast<double>(totalChildGames) / totalGamesFromStartingPosition;
+            double probability = static_cast<double>(totalChildGames) /
+                totalGamesFromStartingPosition;
+
             if (probability > 0.001) {
-                chessNode* child = new chessNode(whiteWins, blackWins, draws, move["uci"]);
+                chessNode* child = new chessNode(whiteWins, blackWins, draws, move);
                 node->addChild(child);
 
-                std::string newMoves = moves;
-                if (!newMoves.empty()) { newMoves += ","; }
-                newMoves += move["uci"];
-
-                buildTree(child, FEN, newMoves, !whiteToMove, totalGamesFromStartingPosition);
+                buildTree(txn, child, updatedFen, !whiteToMove,
+                    totalGamesFromStartingPosition);
             }
         }
     }
-
-    curl_easy_cleanup(curl);
 }
 
-int getStartingTotalNumGames(std::string FEN) {
-    CURL *curl = curl_easy_init();
-    if (!curl) { return 1; }
+int getStartingTotalNumGames(pqxx::work& txn, std::string FEN) {
+    // Query the database for data for the given FEN
+    pqxx::result result = txn.exec_params(
+        "SELECT white_wins, black_wins, draws FROM lichess WHERE fen = $1", FEN);
 
-    std::string url = "https://explorer.lichess.ovh/lichess?variant=standard&speeds=blitz,rapid,classical&ratings=2200,2500&fen=";
-    url += FEN;
-
-    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-
-    std::string response_string;
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writeFunction);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response_string);
-
-    CURLcode res = curl_easy_perform(curl);
-    if (res != CURLE_OK) {
-        std::cerr << "curl_easy_perform() failed: " << curl_easy_strerror(res) << std::endl;
+    // Check if a row was returned
+    if (result.size() == 0) {
+        // No data was found for the given FEN
         return 1;
     }
-    json j = json::parse(response_string);
-    int totalGamesFromStartingPosition = j["white"].get<int>() + j["black"].get<int>() + j["draws"].get<int>();
+
+    // Get the data from the result
+    int whiteWins = result[0][0].as<int>();
+    int blackWins = result[0][1].as<int>();
+    int draws = result[0][2].as<int>();
+    int totalGamesFromStartingPosition = whiteWins + blackWins + draws;
     return totalGamesFromStartingPosition;
-}
-
-std::string url_encode(const std::string &value) {
-  std::ostringstream escaped;
-  escaped.fill('0');
-  escaped << std::hex;
-
-  for (char c : value) {
-    if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
-      escaped << c;
-    } else {
-      escaped << std::uppercase;
-      escaped << '%' << std::setw(2) << int((unsigned char) c);
-      escaped << std::nouppercase;
-    }
-  }
-
-  return escaped.str();
 }
 
 void traverseTree(chessNode* root, std::string pgn, std::ofstream& outputFile) {
@@ -208,24 +245,28 @@ void traverseTree(chessNode* root, std::string pgn, std::ofstream& outputFile) {
         pgn += "\n";
         outputFile << pgn;
     }
-    for(int i = 0; i < root->getNumChildren(); i++) {
+    for (int i = 0; i < root->getNumChildren(); i++) {
         traverseTree(root->getChild(i), pgn, outputFile);
     }
     delete root;
 }
 
 int main() {
-    //std::string FEN = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR%20w%20KQkq%20-%200%201";
+    // std::string FEN = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR%20w%20KQkq%20-%200%201";
     std::string FEN = "rnbqkbnr/ppp2ppp/4p3/3p4/3PP3/2N5/PPP2PPP/R1BQKBNR b KQkq - 1 3";
     // std::cout << "Enter the FEN: ";
     // std::getline(std::cin, FEN);
 
-    std::string htmlFEN = url_encode(FEN);
+    // Connect to the PostgreSQL database
+    pqxx::connection conn(
+        "host=localhost port=5432 dbname=mydatabase user=myuser password=mypassword");
+    pqxx::work txn(conn);
+
     bool whiteToMove = false;
     chessNode root(0, 0, 0, "");
 
-    int totalGamesFromStart = getStartingTotalNumGames(htmlFEN);
-    buildTree(&root, htmlFEN, "", whiteToMove, totalGamesFromStart);
+    int totalGamesFromStart = getStartingTotalNumGames(txn, FEN);
+    buildTree(txn, &root, FEN, whiteToMove, totalGamesFromStart);
 
     std::ofstream ofs("outputPGN.txt");
     traverseTree(&root, "", ofs);
