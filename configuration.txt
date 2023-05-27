@@ -1,0 +1,7 @@
+# This is a configuration file. Put the directories you want to use in here
+FEN=rnbqkbnr/ppp2ppp/4p3/3p4/3PP3/2N5/PPP2PPP/R1BQKBNR b KQkq - 1 3"
+lichessLocation=/TOSHIBAEXT/rawDatabase/lichess_db_standard_rated_2013.pgn
+preprocessingLocation=/TOSHIBAEXT/processing/pre.txt
+postprocessingLocation=/TOSHIBAEXT/processing/post.txt
+databaseVolumeLocation=/TOSHIBAEXT/postgresDatabaseVolume
+databaseConnectionString=host=localhost port=5432 dbname=mydatabase user=myuser password=mypassword

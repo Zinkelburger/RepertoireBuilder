@@ -15,6 +15,8 @@ const std::string& FEN, bool whiteToMove, int totalGamesFromStartingPosition);
 // returns the move with the highest win rate from the childrenMoves
 std::string getBestWhiteMove(pqxx::work& txn,
 const std::vector<std::string>& childrenMoves, const std::string& FEN);
+void traverseTree(chessNode* root, std::string pgn, std::ofstream& outputFile);
+int getStartingTotalNumGames(pqxx::work& txn, std::string FEN);
 
 class chessNode {
  public:
@@ -45,8 +47,43 @@ class chessNode {
     std::vector<chessNode*> children;
 };
 
+int main(void) {
+    // take configurations from configuration.txt
+    std::string FEN;
+    std::string databaseConnectionString;
+    std::ifstream configFile("configuration.txt");
+    std::string line;
+    while (std::getline(configFile, line)) {
+        if (line.find("FEN") != std::string::npos) {
+            FEN = line.substr(line.find("=") + 1);
+        } else if (line.find("databaseConnectionString") != std::string::npos) {
+            databaseConnectionString = line.substr(line.find("=") + 1);
+        }
+    }
+    // Connect to the PostgreSQL database
+    pqxx::connection conn(databaseConnectionString);
+    pqxx::work txn(conn);
+
+    bool whiteToMove = false;
+    chessNode root(0, 0, 0, "");
+
+    int totalGamesFromStart = getStartingTotalNumGames(txn, FEN);
+    buildTree(txn, &root, FEN, whiteToMove, totalGamesFromStart);
+
+    std::ofstream ofs("outputPGN.txt");
+    traverseTree(&root, "", ofs);
+    ofs.close();
+
+    return 0;
+}
+
 std::string getBestWhiteMove(pqxx::work& txn, const std::vector<std::string>& childrenMoves,
 const std::string& FEN) {
+    std::cout << "Children moves: ";
+    for (const auto& move : childrenMoves) {
+        std::cout << move << '|';
+    }
+    std::cout << '\n';
     // Select the highest win rate white move from the top 3 most played moves
     std::vector<std::string> sortedMoves = childrenMoves;
     std::sort(sortedMoves.begin(), sortedMoves.end(),
@@ -167,8 +204,9 @@ bool whiteToMove, int totalGamesFromStartingPosition) {
         childrenMoves.push_back(tempMove);
     }
 
-    if (whiteToMove) {
+    if (whiteToMove && childrenMoves.size() > 0) {
         const std::string& move = getBestWhiteMove(txn, childrenMoves, FEN);
+        std::cout << move << "\n";
 
         chessNode* child = new chessNode(whiteWins, blackWins, draws, move);
         node->addChild(child);
@@ -208,7 +246,9 @@ bool whiteToMove, int totalGamesFromStartingPosition) {
             double probability = static_cast<double>(totalChildGames) /
                 totalGamesFromStartingPosition;
 
-            if (probability > 0.001) {
+            // 1/200 = 0.005, which is greater than 0.001.
+            // If there were only 200 games from a positon, the probability will never be 0.01
+            if (probability > 0.001 && totalChildGames > 5) {
                 chessNode* child = new chessNode(whiteWins, blackWins, draws, move);
                 node->addChild(child);
 
@@ -248,29 +288,5 @@ void traverseTree(chessNode* root, std::string pgn, std::ofstream& outputFile) {
     for (int i = 0; i < root->getNumChildren(); i++) {
         traverseTree(root->getChild(i), pgn, outputFile);
     }
-    delete root;
 }
 
-int main() {
-    // std::string FEN = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR%20w%20KQkq%20-%200%201";
-    std::string FEN = "rnbqkbnr/ppp2ppp/4p3/3p4/3PP3/2N5/PPP2PPP/R1BQKBNR b KQkq - 1 3";
-    // std::cout << "Enter the FEN: ";
-    // std::getline(std::cin, FEN);
-
-    // Connect to the PostgreSQL database
-    pqxx::connection conn(
-        "host=localhost port=5432 dbname=mydatabase user=myuser password=mypassword");
-    pqxx::work txn(conn);
-
-    bool whiteToMove = false;
-    chessNode root(0, 0, 0, "");
-
-    int totalGamesFromStart = getStartingTotalNumGames(txn, FEN);
-    buildTree(txn, &root, FEN, whiteToMove, totalGamesFromStart);
-
-    std::ofstream ofs("outputPGN.txt");
-    traverseTree(&root, "", ofs);
-    ofs.close();
-
-    return 0;
-}

@@ -15,19 +15,37 @@ int main(int argc, char *argv[]) {
         std::cerr << "Usage: " << argv[0] << " [PGN file] [database connection string]" << std::endl;
         return 1;
     }*/
-    std::string pgnFileInitial = "lichess_db_standard_rated_2013-01.pgn";
-    std::string databaseConnectionString =
-        "host=localhost port=5432 dbname=mydatabase user=myuser password=mypassword";
+    // load the values from the config file
+    std::ifstream configFile("configuration.txt");
+    std::string inpLine;
+    std::string pgnLocation;
+    std::string databaseConnectionString;
+    std::string preprocessedPgnLocation;
+    std::string postProcessedPgnLocation;
+    while (std::getline(configFile, inpLine)) {
+        if (inpLine.find("lichessLocation") != std::string::npos) {
+            pgnLocation = inpLine.substr(inpLine.find("=") + 1);
+        } else if (inpLine.find("preprocessingLocation") != std::string::npos) {
+            preprocessedPgnLocation = inpLine.substr(inpLine.find("=") + 1);
+        } else if (inpLine.find("postprocessingLocation") != std::string::npos) {
+            postProcessedPgnLocation = inpLine.substr(inpLine.find("=") + 1);
+        } else if (inpLine.find("databaseConnectionString") != std::string::npos) {
+            databaseConnectionString = inpLine.substr(inpLine.find("=") + 1);
+        }
+    }
 
-    std::filesystem::path filePath = "/tmp/lichess.pgn";
-    // Check if the file exists
+    // where to store the post-processed pgn (so it doesn't have to be recomputed)
+    std::ofstream outputPgn(postProcessedPgnLocation);
+
+    // Check if the pre-processed pgn exists
+    std::filesystem::path filePath = preprocessedPgnLocation;
     if (std::filesystem::exists(filePath)) {
         std::cout << "File exists. Skipping parsing.\n";
     } else {
         // Pre-process the PGN file using pgn-extract
         std::string pgn_extract_cmd = "pgn-extract --fencomments -C -N -V ";
-        pgn_extract_cmd += pgnFileInitial;
-        pgn_extract_cmd += " -o/tmp/lichess.pgn";
+        pgn_extract_cmd += pgnLocation;
+        pgn_extract_cmd += " -o" + preprocessedPgnLocation;
         pgn_extract_cmd += " >/dev/null 2>&1";
         int status = system(pgn_extract_cmd.c_str());
         if (status != 0) {
@@ -54,66 +72,93 @@ int main(int argc, char *argv[]) {
     char c;
     // getline until it is no longer the pgn header.
     // Then switch to processing FENs and moves char by char
-    while (std::getline(pgn_file, line)) {
-        linesRead++;
-        std::string result;
+    while (!pgn_file.eof()) {
+        std::string result, numberString;
+        double avgRating =  -1;
+        // they need to have some value to use O3. The low average will cause them to not be parsed
+        int whiteElo = INT32_MIN, blackElo = INT32_MIN;
         bool moreMoves = true;
 
         // if c is [, then read the line. Otherwise parse the FEN char by char
         while (std::getline(pgn_file, line), line.find('[') != std::string::npos) {
             linesRead++;
             if (line.find("Result") != std::string::npos) {
-                // results can be of varying lengths, but there are always between two ""
+                // results can be of varying lengths, but they are always between two ""
                 result = line.substr(line.find("\"") + 1);
                 result = result.substr(0, result.find("\""));
+            } else if (line.find("WhiteElo") != std::string::npos) {
+                // elo can be of varying lengths, but thet are always between two ""
+                numberString = line.substr(line.find("\"") + 1);
+                numberString = numberString.substr(0, numberString.find("\""));
+                std::cout << "W:" << numberString << "\n";
+                if (numberString != "?") {
+                    whiteElo = stoi(numberString);
+                } else {
+                    continue;
+                }
+            } else if (line.find("BlackElo") != std::string::npos) {
+                // elo can be of varying lengths, but thet are always between two ""
+                numberString = line.substr(line.find("\"") + 1);
+                numberString = numberString.substr(0, numberString.find("\""));
+                std::cout << "B:" << numberString << "\n";
+                if (numberString != "?") {
+                    blackElo = stoi(numberString);
+                } else {
+                    continue;
+                }
             }
         }
+        // avgRating is useful, as it lets us skip parsing entries below a certain rating.
+        // skipping entries means the output file / database can be 90% smaller
+        avgRating = whiteElo + blackElo / 2.0;
 
-        // now the header part is done, and we can continue parsing the FENs
-        while (moreMoves) {
-            std::string fen, move;
-            while (pgn_file.get(c), c != '{') { linesRead += 0.02; }
-            if (c == '{') {
-                while (pgn_file.get(c), c != '}') {
-                    linesRead += 0.02;
-                    // add everything besides the newlines to the fen
-                    if (c != '\n') {
-                        fen += c;
-                    } else {
-                        fen += " ";
+        if (avgRating > 2000) {
+            // now the header part is done, and we can continue parsing the FENs
+            while (moreMoves) {
+                std::string fen, move;
+                while (pgn_file.get(c), c != '{') { linesRead += 0.02; }
+                if (c == '{') {
+                    while (pgn_file.get(c), c != '}') {
+                        linesRead += 0.02;
+                        // add everything besides the newlines to the fen
+                        if (c != '\n') {
+                            fen += c;
+                        } else {
+                            fen += " ";
+                        }
                     }
+                    // first and last char are a <space>
+                    // odd edge case where the first char is a newline or something
+                    // and in that case the first space is the b KQkq part of the FEN
+                    // which is wrong
+                    std::size_t spaceIndex = fen.find(" ");
+                    if (spaceIndex < 4) {
+                        fen = fen.substr(fen.find(" ") + 1);
+                    }
+                    std::size_t lastNonSpace = fen.find_last_not_of(' ');
+                    fen = fen.substr(0, lastNonSpace + 1);
+
+                    move = extractMove(pgn_file);
+
+                    // edge case at the end of the game
+                    if (move == "Event") {
+                        move = "";
+                        moreMoves = false;
+                    }
+                // std::cout << avgRating << ":" << fen << ":" << result << ":" << move << "\n";
+                    insertToDatabase(txn, fen, result, move);
+                    outputPgn << avgRating << ":" << fen << ":" << result << ":" << move << "\n";
                 }
-                // first and last char are a <space>
-                // fen = fen.substr(1, fen.length()-1);
-
-                // odd edge case where the first char is a newline or something
-                // and then the first space is the b KQkq part of the FEN, which is wrong
-                std::size_t spaceIndex = fen.find(" ");
-                if (spaceIndex < 4) {
-                    fen = fen.substr(fen.find(" ") + 1);
-                }
-                std::size_t lastNonSpace = fen.find_last_not_of(' ');
-                fen = fen.substr(0, lastNonSpace + 1);
-
-                move = extractMove(pgn_file);
-
-                // edge case at the end of the game
-                if (move == "Event") {
-                    move = "";
-                    moreMoves = false;
-                }
-
-                // printing for debugging
-                // std::cout << "FEN:" << fen << ":move:" << move << ":result:" << result << "\n";
-
-                insertToDatabase(txn, fen, result, move);
             }
-        }
-        if (linesRead > 1500 * multiplier) {
-            std::cout << "Read " << linesRead << " lines\n";
-            // Commit the transaction. Not too often
-            txn.commit();
-            multiplier++;
+            if (linesRead > 1500 * multiplier) {
+                std::cout << "Read " << linesRead << " lines\n";
+                // Commit the transaction. Not too often
+                txn.commit();
+                multiplier++;
+            }
+        // otherwise continue reading lines until you get to the next game
+        } else {
+            while (std::getline(pgn_file, line), line.find('[') != std::string::npos) {}
         }
     }
 
