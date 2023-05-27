@@ -21,9 +21,7 @@ Finally, when the program is run with `./repertoireBuilder`, it will query the p
 ### Note
 The database stores the full FEN, including the en passant information, which lichess sometimes omits.
 
-## Libraries needed
-sudo apt install libpq-dev
-
+## Installations needed
 sudo apt install libpqxx-dev
 
 sudo apt install pgn-extract
